@@ -1,0 +1,1 @@
+# hyprland-laptop-lid-configuration-script
