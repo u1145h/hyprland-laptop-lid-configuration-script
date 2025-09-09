@@ -1,0 +1,405 @@
+#!/bin/bash
+
+# Hyprland Laptop Lid Handler - One-Click Installer
+# This script configures laptop lid behavior based on power state:
+# - AC Power + Lid Closed: Disable laptop display
+# - Battery + Lid Closed: Suspend system
+
+set -e  # Exit on any error
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Logging functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Check if running as root
+check_root() {
+    if [[ $EUID -eq 0 ]]; then
+        log_error "This script should not be run as root. Please run as a normal user."
+        log_info "The script will ask for sudo password when needed."
+        exit 1
+    fi
+}
+
+# Detect distribution
+detect_distro() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        DISTRO=$ID
+    else
+        log_error "Cannot detect distribution"
+        exit 1
+    fi
+}
+
+# Install acpid based on distribution
+install_acpid() {
+    log_info "Installing acpid daemon..."
+    
+    case $DISTRO in
+        arch|manjaro|garuda)
+            sudo pacman -S --noconfirm acpid || {
+                log_error "Failed to install acpid"
+                exit 1
+            }
+            ;;
+        ubuntu|debian|pop)
+            sudo apt update && sudo apt install -y acpid || {
+                log_error "Failed to install acpid"
+                exit 1
+            }
+            ;;
+        fedora)
+            sudo dnf install -y acpid || {
+                log_error "Failed to install acpid"
+                exit 1
+            }
+            ;;
+        opensuse*)
+            sudo zypper install -y acpid || {
+                log_error "Failed to install acpid"
+                exit 1
+            }
+            ;;
+        *)
+            log_warning "Unknown distribution. Please install 'acpid' manually."
+            read -p "Press Enter to continue after installing acpid, or Ctrl+C to exit..."
+            ;;
+    esac
+    
+    log_success "acpid installed successfully"
+}
+
+# Check if Hyprland is running
+check_hyprland() {
+    if [ -z "$HYPRLAND_INSTANCE_SIGNATURE" ]; then
+        log_warning "Hyprland is not currently running or HYPRLAND_INSTANCE_SIGNATURE is not set."
+        log_info "The installation will continue, but testing will be limited."
+        return 1
+    fi
+    return 0
+}
+
+# Detect laptop display
+detect_laptop_display() {
+    if check_hyprland; then
+        LAPTOP_DISPLAY=$(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.name | startswith("eDP")) | .name' | head -n1 2>/dev/null || echo "")
+        
+        if [ -z "$LAPTOP_DISPLAY" ]; then
+            # Fallback detection
+            LAPTOP_DISPLAY="eDP-1"
+            log_warning "Could not auto-detect laptop display. Using default: eDP-1"
+        else
+            log_success "Detected laptop display: $LAPTOP_DISPLAY"
+        fi
+    else
+        LAPTOP_DISPLAY="eDP-1"
+        log_info "Using default laptop display: eDP-1"
+    fi
+}
+
+# Get display resolution and refresh rate
+get_display_specs() {
+    if check_hyprland; then
+        DISPLAY_INFO=$(hyprctl monitors 2>/dev/null | grep -A 10 "$LAPTOP_DISPLAY" | head -20)
+        
+        # Extract resolution and refresh rate
+        RESOLUTION=$(echo "$DISPLAY_INFO" | grep -oP '\d+x\d+@\d+\.\d+' | head -1 | cut -d'@' -f1)
+        REFRESH_RATE=$(echo "$DISPLAY_INFO" | grep -oP '\d+x\d+@\d+\.\d+' | head -1 | cut -d'@' -f2 | cut -d'.' -f1)
+        SCALE=$(echo "$DISPLAY_INFO" | grep "scale:" | awk '{print $2}')
+        
+        # Set defaults if detection fails
+        RESOLUTION=${RESOLUTION:-"1920x1080"}
+        REFRESH_RATE=${REFRESH_RATE:-"60"}
+        SCALE=${SCALE:-"1"}
+        
+        log_info "Display specs: ${RESOLUTION}@${REFRESH_RATE}Hz, Scale: ${SCALE}"
+    else
+        RESOLUTION="1920x1080"
+        REFRESH_RATE="60"
+        SCALE="1"
+        log_info "Using default display specs: ${RESOLUTION}@${REFRESH_RATE}Hz, Scale: ${SCALE}"
+    fi
+}
+
+# Configure systemd logind
+configure_logind() {
+    log_info "Configuring systemd logind to ignore lid events..."
+    
+    # Backup original file
+    if [ -f /etc/systemd/logind.conf ]; then
+        sudo cp /etc/systemd/logind.conf /etc/systemd/logind.conf.backup.$(date +%Y%m%d_%H%M%S)
+        log_info "Backed up original logind.conf"
+    fi
+    
+    # Configure lid handling
+    sudo tee /etc/systemd/logind.conf > /dev/null << EOF
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+HandleSuspendKey=suspend
+HandleHibernateKey=hibernate
+HandlePowerKey=poweroff
+EOF
+    
+    log_success "systemd logind configured"
+}
+
+# Create lid handler script
+create_lid_handler() {
+    log_info "Creating lid handler script..."
+    
+    sudo tee /usr/local/bin/lid-handler.sh > /dev/null << EOF
+#!/bin/bash
+
+# Hyprland Laptop Lid Handler
+# Generated by installer on $(date)
+
+# Function to check if on AC power
+is_on_ac_power() {
+    for adapter in /sys/class/power_supply/A{C,DP}*; do
+        [ -r "\$adapter/online" ] && [ "\$(cat "\$adapter/online")" = "1" ] && return 0
+    done
+    return 1
+}
+
+# Display configuration
+LAPTOP_DISPLAY="$LAPTOP_DISPLAY"
+RESOLUTION="$RESOLUTION"
+REFRESH_RATE="$REFRESH_RATE"
+SCALE="$SCALE"
+
+# Check lid state
+LID_STATE=\$(cat /proc/acpi/button/lid/*/state 2>/dev/null | awk '{print \$2}')
+
+# Log for debugging (optional)
+# echo "\$(date): Lid state: \$LID_STATE, AC Power: \$(is_on_ac_power && echo 'yes' || echo 'no')" >> /tmp/lid-handler.log
+
+if is_on_ac_power; then
+    # On AC power
+    if [ "\$LID_STATE" = "closed" ]; then
+        # Disable laptop display
+        hyprctl keyword monitor "\$LAPTOP_DISPLAY,disable" 2>/dev/null
+    else
+        # Enable laptop display with optimal settings
+        hyprctl keyword monitor "\$LAPTOP_DISPLAY,\$RESOLUTION@\$REFRESH_RATE,0x0,\$SCALE" 2>/dev/null
+    fi
+else
+    # On battery
+    if [ "\$LID_STATE" = "closed" ]; then
+        # Suspend system
+        systemctl suspend
+    else
+        # Optionally set lower refresh rate for battery saving
+        hyprctl keyword monitor "\$LAPTOP_DISPLAY,\$RESOLUTION@60,0x0,\$SCALE" 2>/dev/null
+    fi
+fi
+EOF
+    
+    sudo chmod +x /usr/local/bin/lid-handler.sh
+    log_success "Lid handler script created and made executable"
+}
+
+# Create ACPI event configuration
+create_acpi_event() {
+    log_info "Creating ACPI event configuration..."
+    
+    sudo mkdir -p /etc/acpi/events
+    
+    sudo tee /etc/acpi/events/lid > /dev/null << EOF
+event=button/lid.*
+action=/usr/local/bin/lid-handler.sh
+EOF
+    
+    log_success "ACPI event configuration created"
+}
+
+# Start and enable services
+enable_services() {
+    log_info "Enabling and starting services..."
+    
+    # Restart systemd-logind
+    sudo systemctl restart systemd-logind
+    log_success "systemd-logind restarted"
+    
+    # Enable and start acpid
+    sudo systemctl enable acpid
+    sudo systemctl restart acpid
+    
+    if sudo systemctl is-active --quiet acpid; then
+        log_success "acpid service is running"
+    else
+        log_error "Failed to start acpid service"
+        exit 1
+    fi
+}
+
+# Test the installation
+test_installation() {
+    log_info "Testing installation..."
+    
+    # Test lid state detection
+    if [ -r /proc/acpi/button/lid/*/state ]; then
+        LID_STATE=$(cat /proc/acpi/button/lid/*/state 2>/dev/null | awk '{print $2}')
+        log_success "Lid state detection works. Current state: $LID_STATE"
+    else
+        log_error "Cannot read lid state. Check if /proc/acpi/button/lid/ exists"
+        return 1
+    fi
+    
+    # Test power detection
+    POWER_SUPPLIES=$(ls /sys/class/power_supply/ 2>/dev/null | grep -E '^A(C|DP)' | head -5)
+    if [ -n "$POWER_SUPPLIES" ]; then
+        log_success "Power supply detection works. Found: $(echo $POWER_SUPPLIES | tr '\n' ' ')"
+    else
+        log_warning "Power supply auto-detection may not work. Please check /sys/class/power_supply/"
+    fi
+    
+    # Test script execution
+    log_info "Testing script execution..."
+    if /usr/local/bin/lid-handler.sh; then
+        log_success "Script executed successfully"
+    else
+        log_warning "Script execution completed with warnings (this is normal if not in Hyprland)"
+    fi
+}
+
+# Create uninstaller
+create_uninstaller() {
+    log_info "Creating uninstaller script..."
+    
+    cat > ~/hyprland-lid-uninstaller.sh << 'EOF'
+#!/bin/bash
+
+# Hyprland Lid Handler Uninstaller
+
+echo "Uninstalling Hyprland Lid Handler..."
+
+# Remove ACPI event
+sudo rm -f /etc/acpi/events/lid
+
+# Remove lid handler script
+sudo rm -f /usr/local/bin/lid-handler.sh
+
+# Restore systemd logind (if backup exists)
+BACKUP=$(ls /etc/systemd/logind.conf.backup.* 2>/dev/null | sort | tail -1)
+if [ -n "$BACKUP" ]; then
+    sudo mv "$BACKUP" /etc/systemd/logind.conf
+    echo "Restored original logind.conf"
+else
+    # Reset to default
+    sudo tee /etc/systemd/logind.conf > /dev/null << 'EOCONF'
+[Login]
+#HandleLidSwitch=suspend
+#HandleLidSwitchExternalPower=suspend
+#HandleLidSwitchDocked=ignore
+EOCONF
+    echo "Reset logind.conf to default"
+fi
+
+# Restart services
+sudo systemctl restart systemd-logind
+sudo systemctl restart acpid
+
+echo "Uninstallation complete!"
+echo "You can remove this uninstaller with: rm ~/hyprland-lid-uninstaller.sh"
+EOF
+    
+    chmod +x ~/hyprland-lid-uninstaller.sh
+    log_success "Uninstaller created at ~/hyprland-lid-uninstaller.sh"
+}
+
+# Main installation function
+main() {
+    echo -e "${BLUE}"
+    echo "=========================================="
+    echo "  Hyprland Laptop Lid Handler Installer  "
+    echo "=========================================="
+    echo -e "${NC}"
+    echo
+    echo "This installer will configure your laptop lid behavior:"
+    echo "• AC Power + Lid Closed  → Disable laptop display"
+    echo "• Battery + Lid Closed   → Suspend system"
+    echo "• Lid Opened            → Restore display"
+    echo
+    
+    read -p "Do you want to continue? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_info "Installation cancelled"
+        exit 0
+    fi
+    
+    log_info "Starting installation..."
+    
+    # Pre-installation checks
+    check_root
+    detect_distro
+    log_info "Detected distribution: $DISTRO"
+    
+    # Install dependencies
+    install_acpid
+    
+    # Detect hardware
+    detect_laptop_display
+    get_display_specs
+    
+    # Configure system
+    configure_logind
+    create_lid_handler
+    create_acpi_event
+    enable_services
+    
+    # Test and finalize
+    test_installation
+    create_uninstaller
+    
+    echo
+    echo -e "${GREEN}"
+    echo "=========================================="
+    echo "         INSTALLATION COMPLETE!          "
+    echo "=========================================="
+    echo -e "${NC}"
+    echo
+    echo "Your laptop lid is now configured:"
+    echo "• Display: $LAPTOP_DISPLAY"
+    echo "• Resolution: ${RESOLUTION}@${REFRESH_RATE}Hz"
+    echo "• Scale: ${SCALE}x"
+    echo
+    echo "Testing:"
+    echo "• Close lid on AC power  → Display should turn off"
+    echo "• Open lid on AC power   → Display should turn on"
+    echo "• Close lid on battery   → System should suspend"
+    echo
+    echo "Files created:"
+    echo "• /usr/local/bin/lid-handler.sh (main script)"
+    echo "• /etc/acpi/events/lid (ACPI event handler)"
+    echo "• ~/hyprland-lid-uninstaller.sh (uninstaller)"
+    echo
+    echo "To uninstall: ./hyprland-lid-uninstaller.sh"
+    echo
+    log_success "Installation completed successfully!"
+}
+
+# Run main function
+main "$@"
